@@ -1,0 +1,251 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Campus Clash</title>
+  <style>
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      padding: 24px;
+      display: grid;
+      place-items: center;
+      color: #17203a;
+      font: 16px system-ui, sans-serif;
+      background: linear-gradient(135deg, #7147ff, #14c8c8);
+    }
+    main {
+      width: min(100%, 620px);
+      padding: 28px;
+      border-radius: 24px;
+      background: white;
+      box-shadow: 0 20px 60px #17203a40;
+    }
+    h1 { margin: 0 0 8px; font-size: 2rem; }
+    h2 { margin: 24px 0 12px; }
+    input, button {
+      width: 100%;
+      margin-top: 10px;
+      padding: 13px 15px;
+      border: 1px solid #d8dcef;
+      border-radius: 12px;
+      font: inherit;
+    }
+    button {
+      border: 0;
+      color: white;
+      font-weight: 700;
+      background: #6544f5;
+      cursor: pointer;
+    }
+    button:disabled { opacity: .5; cursor: default; }
+    .secondary { color: #17203a; background: #eef0ff; }
+    .choice { text-align: left; }
+    .muted { color: #68708a; }
+    .row { display: flex; gap: 10px; }
+    .row > * { flex: 1; }
+    .card {
+      margin-top: 14px;
+      padding: 16px;
+      border-radius: 14px;
+      background: #f4f5fb;
+    }
+    #message { min-height: 24px; color: #b42318; }
+    #roomLink { word-break: break-all; }
+    @media (max-width: 480px) {
+      body { padding: 12px; }
+      main { padding: 20px; }
+      .row { flex-direction: column; gap: 0; }
+    }
+  </style>
+</head>
+<body>
+<main>
+  <h1>⚡ Campus Clash</h1>
+  <p class="muted">The Ultimate Quiz Battle · 2–8 players</p>
+  <div id="message"></div>
+  <section id="entry">
+    <input id="name" maxlength="18" placeholder="Your nickname">
+    <button id="create">Create a room</button>
+    <div class="row">
+      <input id="code" maxlength="6" placeholder="Room code">
+      <button id="join" class="secondary">Join room</button>
+    </div>
+  </section>
+  <section id="game" hidden></section>
+</main>
+
+<script src="/socket.io/socket.io.js"></script>
+<script>
+  const socket = io();
+  const entry = document.querySelector("#entry");
+  const game = document.querySelector("#game");
+  const message = document.querySelector("#message");
+  let room = null;
+  let tick = null;
+
+  function showError(text) {
+    message.textContent = text || "";
+  }
+
+  function request(event, data) {
+    return new Promise((resolve) => {
+      socket.emit(event, data, resolve);
+    });
+  }
+
+  async function enterRoom(event, payload) {
+    const result = await request(event, payload);
+    if (result.error) return showError(result.error);
+
+    room = result.room;
+    entry.hidden = true;
+    game.hidden = false;
+    render(room);
+  }
+
+  document.querySelector("#create").onclick = () => {
+    showError("");
+    enterRoom("room:create", {
+      name: document.querySelector("#name").value
+    });
+  };
+
+  document.querySelector("#join").onclick = () => {
+    showError("");
+    enterRoom("room:join", {
+      name: document.querySelector("#name").value,
+      code: document.querySelector("#code").value
+    });
+  };
+
+  socket.on("room:update", (updatedRoom) => {
+    if (room && updatedRoom.code === room.code) {
+      room = updatedRoom;
+      render(room);
+    }
+  });
+
+  function render(state) {
+    clearInterval(tick);
+    const isHost = socket.id === state.hostId;
+    const players = state.players
+      .map((player) => `<li>${escapeHtml(player.name)} — ${player.score} pts</li>`)
+      .join("");
+
+    let html = `
+      <div class="card">
+        Room code: <strong>${state.code}</strong>
+        <p id="roomLink" class="muted"></p>
+        <button class="secondary" id="copy">Copy invite link</button>
+      </div>
+      <h2>Players (${state.players.length}/8)</h2>
+      <ul>${players}</ul>
+    `;
+
+    if (state.status === "lobby") {
+      html += isHost
+        ? `<button id="start">Start game</button>`
+        : `<p class="muted">Waiting for the host to start…</p>`;
+    }
+
+    if (state.status === "question" && state.question) {
+      html += `
+        <div class="card">
+          <p class="muted">${escapeHtml(state.question.category)} · Question ${state.questionNumber}/${state.totalQuestions}</p>
+          <h2>${escapeHtml(state.question.text)}</h2>
+          <p>Time left: <strong id="clock"></strong></p>
+          <div id="choices">
+            ${state.question.choices.map((choice, index) =>
+              `<button class="choice" data-choice="${index}">${escapeHtml(choice)}</button>`
+            ).join("")}
+          </div>
+          <p class="muted">Correct answer: 100 points + up to 150 speed bonus</p>
+        </div>
+      `;
+    }
+
+    if (state.status === "reveal" && state.lastQuestion) {
+      html += `
+        <div class="card">
+          <h2>Correct answer: ${escapeHtml(state.lastQuestion.correctText)}</h2>
+          <h3>Leaderboard</h3>
+          ${leaderboard(state.lastQuestion.leaderboard)}
+          <p class="muted">Next question starts shortly…</p>
+        </div>
+      `;
+    }
+
+    if (state.status === "finished") {
+      const sorted = [...state.players].sort((a, b) => b.score - a.score);
+      const winner = sorted[0];
+      html += `
+        <div class="card">
+          <h2>🏆 ${winner ? escapeHtml(winner.name) + " wins!" : "Game over"}</h2>
+          ${leaderboard(sorted)}
+          ${isHost ? `<button id="again">Play Again</button>` : `<p>Waiting for the host to play again…</p>`}
+        </div>
+      `;
+    }
+
+    game.innerHTML = html;
+
+    const inviteUrl = location.origin + "/?room=" + state.code;
+    document.querySelector("#roomLink").textContent = inviteUrl;
+    document.querySelector("#copy").onclick = () => navigator.clipboard
+      .writeText(inviteUrl)
+      .then(() => showError("Invite link copied!"))
+      .catch(() => showError("Copy this link: " + inviteUrl));
+
+    document.querySelector("#start")?.addEventListener("click", async () => {
+      const result = await request("game:start", { code: state.code });
+      if (result.error) showError(result.error);
+    });
+
+    document.querySelector("#again")?.addEventListener("click", async () => {
+      const result = await request("game:again", { code: state.code });
+      if (result.error) showError(result.error);
+    });
+
+    document.querySelectorAll("[data-choice]").forEach((button) => {
+      button.onclick = async () => {
+        document.querySelectorAll("[data-choice]").forEach((b) => b.disabled = true);
+        const result = await request("answer:submit", {
+          code: state.code,
+          choice: button.dataset.choice
+        });
+        if (result.error) showError(result.error);
+        else showError("Answer submitted!");
+      };
+    });
+
+    if (state.status === "question") {
+      const updateClock = () => {
+        const seconds = Math.max(0, Math.ceil((state.question.endsAt - Date.now()) / 1000));
+        const clock = document.querySelector("#clock");
+        if (clock) clock.textContent = seconds + "s";
+      };
+      updateClock();
+      tick = setInterval(updateClock, 200);
+    }
+  }
+
+  function leaderboard(players) {
+    return `<ol>${players.map((player) =>
+      `<li>${escapeHtml(player.name)} — ${player.score} pts</li>`
+    ).join("")}</ol>`;
+  }
+
+  function escapeHtml(value) {
+    return String(value).replace(/[&<>"']/g, (char) => ({
+      "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"
+    })[char]);
+  }
+
+  const inviteCode = new URLSearchParams(location.search).get("room");
+  if (inviteCode) document.querySelector("#code").value = inviteCode;
+</script>
+</body>
+</html>
